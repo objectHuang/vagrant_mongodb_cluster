@@ -1,0 +1,225 @@
+---
+- name: Configure MongoDB Cluster
+  hosts: mongodb_nodes
+  become: true
+  vars:
+    mongodb_version: "7.0"
+    mongodb_replica_set_name: "rs0"
+    mongodb_port: 27017
+    mongodb_bind_ip: "0.0.0.0"
+    mongodb_data_dir: "/var/lib/mongodb"
+    mongodb_log_dir: "/var/log/mongodb"
+    
+  tasks:
+    - name: Install required packages
+      apt:
+        name:
+          - gnupg
+          - curl
+          - apt-transport-https
+          - ca-certificates
+        state: present
+        update_cache: yes
+
+    - name: Check if MongoDB GPG key exists
+      stat:
+        path: /usr/share/keyrings/mongodb-server-{{ mongodb_version }}.gpg
+      register: gpg_key
+
+    - name: Import MongoDB public GPG key
+      shell: |
+        curl -fsSL https://pgp.mongodb.com/server-{{ mongodb_version }}.asc | gpg --dearmor -o /usr/share/keyrings/mongodb-server-{{ mongodb_version }}.gpg
+      when: not gpg_key.stat.exists
+
+    - name: Add MongoDB repository
+      copy:
+        content: |
+          deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-{{ mongodb_version }}.gpg ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/{{ mongodb_version }} multiverse
+        dest: /etc/apt/sources.list.d/mongodb-org-{{ mongodb_version }}.list
+        mode: '0644'
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Install MongoDB packages
+      apt:
+        name: mongodb-org
+        state: present
+
+    - name: Create MongoDB data directory
+      file:
+        path: "{{ mongodb_data_dir }}"
+        state: directory
+        owner: mongodb
+        group: mongodb
+        mode: '0755'
+
+    - name: Create MongoDB log directory
+      file:
+        path: "{{ mongodb_log_dir }}"
+        state: directory
+        owner: mongodb
+        group: mongodb
+        mode: '0755'
+
+    - name: Check if MongoDB keyfile exists on primary
+      stat:
+        path: /etc/mongodb-keyfile
+      register: keyfile_stat
+      delegate_to: "{{ groups['mongodb_primary'][0] }}"
+      run_once: true
+
+    - name: Generate MongoDB keyfile for authentication on primary
+      shell: |
+        openssl rand -base64 756 > /etc/mongodb-keyfile
+        chmod 400 /etc/mongodb-keyfile
+        chown mongodb:mongodb /etc/mongodb-keyfile
+      when: not keyfile_stat.stat.exists
+      run_once: true
+      delegate_to: "{{ groups['mongodb_primary'][0] }}"
+
+    - name: Fetch keyfile from primary
+      slurp:
+        src: /etc/mongodb-keyfile
+      delegate_to: "{{ groups['mongodb_primary'][0] }}"
+      register: keyfile_content
+      run_once: true
+
+    - name: Distribute keyfile to all nodes
+      copy:
+        content: "{{ keyfile_content.content | b64decode }}"
+        dest: /etc/mongodb-keyfile
+        owner: mongodb
+        group: mongodb
+        mode: '0400'
+
+    - name: Configure MongoDB (without auth for initial setup)
+      template:
+        src: mongod-init.conf.j2
+        dest: /etc/mongod.conf
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Stop MongoDB service
+      systemd:
+        name: mongod
+        state: stopped
+      ignore_errors: yes
+
+    - name: Start MongoDB service
+      systemd:
+        name: mongod
+        state: started
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Wait for MongoDB to be ready
+      wait_for:
+        port: "{{ mongodb_port }}"
+        host: 127.0.0.1
+        delay: 10
+        timeout: 120
+
+- name: Initialize MongoDB Replica Set
+  hosts: mongodb_primary
+  become: true
+  vars:
+    mongodb_replica_set_name: "rs0"
+    mongodb_port: 27017
+    
+  tasks:
+    - name: Wait for all MongoDB instances to be ready
+      wait_for:
+        host: "{{ item }}"
+        port: "{{ mongodb_port }}"
+        delay: 5
+        timeout: 120
+      loop:
+        - mongo1
+        - mongo2
+        - mongo3
+
+    - name: Check if replica set is already initialized
+      shell: mongosh --quiet --eval "try { rs.status().ok } catch(e) { 0 }"
+      register: rs_status
+      changed_when: false
+      failed_when: false
+
+    - name: Initialize replica set
+      shell: |
+        mongosh --quiet --eval '
+          rs.initiate({
+            _id: "{{ mongodb_replica_set_name }}",
+            members: [
+              { _id: 0, host: "mongo1:{{ mongodb_port }}", priority: 2 },
+              { _id: 1, host: "mongo2:{{ mongodb_port }}", priority: 1 },
+              { _id: 2, host: "mongo3:{{ mongodb_port }}", priority: 1 }
+            ]
+          })
+        '
+      when: rs_status.stdout != "1"
+      register: rs_init
+
+    - name: Wait for replica set to elect primary
+      shell: mongosh --quiet --eval "rs.status().members.filter(m => m.stateStr === 'PRIMARY').length"
+      register: primary_check
+      until: primary_check.stdout == "1"
+      retries: 30
+      delay: 5
+      when: rs_init.changed
+
+- name: Enable MongoDB Security
+  hosts: mongodb_nodes
+  become: true
+  vars:
+    mongodb_version: "7.0"
+    mongodb_replica_set_name: "rs0"
+    mongodb_port: 27017
+    mongodb_bind_ip: "0.0.0.0"
+    mongodb_data_dir: "/var/lib/mongodb"
+    mongodb_log_dir: "/var/log/mongodb"
+  
+  tasks:
+    - name: Configure MongoDB with security enabled
+      template:
+        src: mongod.conf.j2
+        dest: /etc/mongod.conf
+        owner: root
+        group: root
+        mode: '0644'
+      register: secure_config
+
+    - name: Restart MongoDB with security
+      systemd:
+        name: mongod
+        state: restarted
+      when: secure_config.changed
+
+    - name: Wait for MongoDB to be ready after security enabled
+      wait_for:
+        port: "{{ mongodb_port }}"
+        host: 127.0.0.1
+        delay: 10
+        timeout: 120
+
+- name: Verify MongoDB Cluster
+  hosts: mongodb_primary
+  become: true
+  vars:
+    mongodb_port: 27017
+    
+  tasks:
+    - name: Wait for replica set to stabilize
+      pause:
+        seconds: 10
+
+    - name: Display replica set status
+      shell: mongosh --quiet --eval "rs.status()"
+      register: final_status
+      changed_when: false
+
+    - name: Show replica set status
+      debug:
+        var: final_status.stdout_lines

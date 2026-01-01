@@ -1,0 +1,24 @@
+# mongod.conf - MongoDB configuration file (initial setup without auth)
+
+# Where and how to store data.
+storage:
+  dbPath: {{ mongodb_data_dir }}
+
+# Where to write logging data.
+systemLog:
+  destination: file
+  logAppend: true
+  path: {{ mongodb_log_dir }}/mongod.log
+
+# Network interfaces
+net:
+  port: {{ mongodb_port }}
+  bindIp: {{ mongodb_bind_ip }}
+
+# Process management options
+processManagement:
+  timeZoneInfo: /usr/share/zoneinfo
+
+# Replication settings
+replication:
+  replSetName: {{ mongodb_replica_set_name }}
