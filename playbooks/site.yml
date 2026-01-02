@@ -170,6 +170,24 @@
       delay: 5
       when: rs_init.changed
 
+    - name: Check if admin user exists
+      shell: |
+        mongosh --quiet --eval "db.getSiblingDB('admin').getUser('admin') ? 1 : 0"
+      register: admin_user_check
+      changed_when: false
+      failed_when: false
+
+    - name: Create MongoDB admin user
+      shell: |
+        mongosh --quiet --eval '
+          db.getSiblingDB("admin").createUser({
+            user: "admin",
+            pwd: "admin123",
+            roles: [{ role: "root", db: "admin" }]
+          })
+        '
+      when: admin_user_check.stdout != "1"
+
 - name: Enable MongoDB Security
   hosts: mongodb_nodes
   become: true
